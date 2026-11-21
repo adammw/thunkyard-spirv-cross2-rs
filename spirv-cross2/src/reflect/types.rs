@@ -470,9 +470,11 @@ impl<T> Compiler<T> {
             let base_ty = sys::spvc_type_get_basetype(ty);
             assert_eq!(base_ty, BaseType::Struct);
 
+            // A structure without layout decorations (a loose uniform, an interface block between stages) has no
+            // declared size or offsets; they read as 0 rather than failing, as the strides below do.
             let mut struct_size = 0;
-            sys::spvc_compiler_get_declared_struct_size(self.ptr.as_ptr(), ty, &mut struct_size)
-                .ok(self)?;
+            let _ = sys::spvc_compiler_get_declared_struct_size(self.ptr.as_ptr(), ty, &mut struct_size)
+                .ok(self);
 
             let member_type_len = sys::spvc_type_get_num_member_types(ty);
             let mut members = Vec::with_capacity(member_type_len as usize);
@@ -490,17 +492,17 @@ impl<T> Compiler<T> {
                 };
 
                 let mut size = 0;
-                sys::spvc_compiler_get_declared_struct_member_size(
+                let _ = sys::spvc_compiler_get_declared_struct_member_size(
                     self.ptr.as_ptr(),
                     ty,
                     i,
                     &mut size,
                 )
-                .ok(self)?;
+                .ok(self);
 
                 let mut offset = 0;
-                sys::spvc_compiler_type_struct_member_offset(self.ptr.as_ptr(), ty, i, &mut offset)
-                    .ok(self)?;
+                let _ = sys::spvc_compiler_type_struct_member_offset(self.ptr.as_ptr(), ty, i, &mut offset)
+                    .ok(self);
 
                 let member_ty = sys::spvc_compiler_get_type_handle(self.ptr.as_ptr(), id);
 
@@ -946,6 +948,7 @@ impl<T> Compiler<T> {
 
 #[cfg(test)]
 mod test {
+    use super::TypeInner;
     use crate::error::SpirvCrossError;
     use crate::Compiler;
     use crate::{targets, Module};
@@ -1021,6 +1024,62 @@ mod test {
         );
 
         eprintln!("{:?}", resources);
+        Ok(())
+    }
+
+    /// A uniform block with named members but no `Offset` decorations, such as a front end emits for a structure
+    /// that is not laid out for a buffer.
+    #[test]
+    pub fn struct_without_layout_decorations_can_be_described() -> Result<(), SpirvCrossError> {
+        const OP_CAPABILITY: u32 = (2 << 16) | 17;
+        const OP_MEMORY_MODEL: u32 = (3 << 16) | 14;
+        const OP_ENTRY_POINT: u32 = (5 << 16) | 15;
+        const OP_MEMBER_NAME: u32 = (4 << 16) | 6;
+        const OP_DECORATE: u32 = (3 << 16) | 71;
+        const OP_TYPE_FLOAT: u32 = (3 << 16) | 22;
+        const OP_TYPE_STRUCT: u32 = (4 << 16) | 30;
+        const OP_TYPE_POINTER: u32 = (4 << 16) | 32;
+        const OP_VARIABLE: u32 = (4 << 16) | 59;
+        const OP_TYPE_VOID: u32 = (2 << 16) | 19;
+        const OP_TYPE_FUNCTION: u32 = (3 << 16) | 33;
+        const OP_FUNCTION: u32 = (5 << 16) | 54;
+        const OP_LABEL: u32 = (2 << 16) | 248;
+        const OP_RETURN: u32 = (1 << 16) | 253;
+        const OP_FUNCTION_END: u32 = (1 << 16) | 56;
+        let words = [
+            0x0723_0203, // magic
+            0x0001_0000, // version 1.0
+            0,           // generator
+            9,           // id bound
+            0,           // schema
+            OP_CAPABILITY, 1, // Shader
+            OP_MEMORY_MODEL, 0, 1, // Logical, GLSL450
+            OP_ENTRY_POINT, 0, 5, 0x6e69_616d, 0, // vertex entry point %5 "main"
+            OP_MEMBER_NAME, 2, 0, 0x61, // %2 member 0 is "a"
+            OP_MEMBER_NAME, 2, 1, 0x62, // %2 member 1 is "b"
+            OP_DECORATE, 2, 2, // %2 Block
+            OP_TYPE_FLOAT, 1, 32, // %1 = float
+            OP_TYPE_STRUCT, 2, 1, 1, // %2 = struct { float; float }
+            OP_TYPE_POINTER, 3, 2, 2, // %3 = pointer to %2 in Uniform
+            OP_VARIABLE, 3, 4, 2, // %4 = variable of %3 in Uniform
+            OP_TYPE_VOID, 6, // %6 = void
+            OP_TYPE_FUNCTION, 7, 6, // %7 = void()
+            OP_FUNCTION, 6, 5, 0, 7, // %5 = main
+            OP_LABEL, 8,
+            OP_RETURN,
+            OP_FUNCTION_END,
+        ];
+
+        let compiler: Compiler<targets::None> = Compiler::new(Module::from_words(&words))?;
+        let resources = compiler.shader_resources()?.all_resources()?;
+        let ty = compiler.type_description(resources.uniform_buffers[0].base_type_id)?;
+        match ty.inner {
+            TypeInner::Struct(ty) => {
+                assert_eq!(ty.members.len(), 2);
+                assert!(ty.members.iter().all(|m| m.offset == 0));
+            }
+            other => panic!("expected a struct, found {other:?}"),
+        }
         Ok(())
     }
 }
